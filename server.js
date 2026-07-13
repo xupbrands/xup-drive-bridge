@@ -56,8 +56,12 @@ app.get('/', (req, res) => {
 })
 
 // Step 1: the plugin opens this in a popup window to kick off the Google login.
+// The plugin picks its own sessionId up front (rather than waiting to be told one)
+// because Google's sign-in pages send Cross-Origin-Opener-Policy: same-origin,
+// which severs window.opener on the popup — so postMessage-ing the result back
+// to the opener is not reliable. The plugin polls /api/status with this id instead.
 app.get('/auth/start', (req, res) => {
-  const sessionId = newSessionId()
+  const sessionId = String(req.query.sessionId || '') || newSessionId()
   const params = new URLSearchParams({
     client_id: GOOGLE_CLIENT_ID,
     redirect_uri: REDIRECT_URI,
