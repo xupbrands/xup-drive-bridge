@@ -1,2 +1,8 @@
+# Railway installs dependencies from package-lock.json on every build, so the
+# committed copy is only bloat (and can ship the wrong platform's binaries).
 node_modules/
+
+# Never commit real keys — these live in Railway's Variables tab.
 .env
+.env.*
+!.env.example
