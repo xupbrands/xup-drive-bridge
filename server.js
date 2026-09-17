@@ -28,7 +28,9 @@
 const express = require('express')
 const cors = require('cors')
 const crypto = require('crypto')
-const { getNicheCompetitors, scrapeAsins } = require('./research')
+const { getNicheCompetitors, scrapeAsins, scrapeCopyForAsins, searchMainImages } = require('./research')
+const { buildSummary } = require('./summary')
+const { buildInsights } = require('./insights')
 
 const {
   GOOGLE_CLIENT_ID,
@@ -214,16 +216,76 @@ function renderPopupResult(success, errorMessage, sessionId) {
   const payload = success
     ? { type: 'xup-drive-auth', ok: true, sessionId }
     : { type: 'xup-drive-auth', ok: false, error: errorMessage }
-  const body = success
-    ? 'Connected! You can close this window.'
-    : `Sign-in failed: ${escapeHtml(errorMessage || 'unknown error')}`
-  return `<!doctype html><html><body style="font-family:sans-serif; padding:24px;">
-<p>${body}</p>
+  const heading = success ? 'Signed in' : 'Sign-in failed'
+  const detail = success
+    ? 'Closing this window…'
+    : escapeHtml(errorMessage || 'unknown error')
+
+  // Closing this window is more awkward than it looks. Google serves its sign-in
+  // pages with Cross-Origin-Opener-Policy: same-origin, which severs the link to
+  // the window that opened us — and browsers then often refuse window.close()
+  // because, as far as they are concerned, no script opened this window.
+  //
+  // So we try repeatedly rather than once: a plain close first, then the legacy
+  // `window.open('', '_self')` trick which re-marks the window as script-opened,
+  // and only if everything fails do we show the manual instruction. The plugin
+  // also calls popup.close() from its side once polling confirms the session, so
+  // between the two this almost always closes on its own.
+  return `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>${heading}</title>
+<style>
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0;
+         display: flex; align-items: center; justify-content: center; height: 100vh;
+         background: #fff; color: #111; }
+  .card { text-align: center; padding: 24px; max-width: 320px; }
+  h1 { font-size: 17px; margin: 0 0 6px; }
+  p { font-size: 13px; color: #666; margin: 0; line-height: 1.5; }
+  #manual { display: none; margin-top: 14px; font-size: 13px; color: #111; }
+  .bad h1 { color: #c00; }
+</style>
+</head>
+<body>
+  <div class="card ${success ? '' : 'bad'}">
+    <h1>${heading}</h1>
+    <p>${detail}</p>
+    <p id="manual">You can close this window and return to Figma.</p>
+  </div>
 <script>
-  if (window.opener) { window.opener.postMessage(${JSON.stringify(payload)}, '*') }
-  setTimeout(() => window.close(), 1200)
+(function () {
+  try {
+    if (window.opener) window.opener.postMessage(${JSON.stringify(payload)}, '*')
+  } catch (e) { /* opener severed by COOP — the plugin polls instead */ }
+
+  var attempts = 0
+  function tryClose() {
+    attempts++
+    try { window.close() } catch (e) {}
+    if (window.closed) return
+
+    // Re-mark this window as script-opened, which restores close() permission in
+    // browsers that revoked it when the opener link was cut.
+    if (attempts === 2) {
+      try { window.open('', '_self'); window.close() } catch (e) {}
+    }
+    if (window.closed) return
+
+    if (attempts < 10) {
+      setTimeout(tryClose, 200)
+    } else {
+      var manual = document.getElementById('manual')
+      if (manual) manual.style.display = 'block'
+    }
+  }
+
+  // Failures are worth reading, so give those a moment before closing.
+  setTimeout(tryClose, ${success ? 150 : 2500})
+})()
 </script>
-</body></html>`
+</body>
+</html>`
 }
 
 function escapeHtml(s) {
@@ -298,13 +360,14 @@ async function uploadFileToDrive(accessToken, folderId, name, base64Bytes, mimeT
 
 // Step 3: the plugin sends exported files here once connected.
 app.post('/api/upload', requireOrgMember, async (req, res) => {
-  const { sessionId, folderLink, files } = req.body || {}
+  const { folderLink, files } = req.body || {}
 
-  const session = sessions.get(String(sessionId || ''))
-  if (!session) {
-    res.status(401).json({ error: 'Not connected to Google Drive — please reconnect' })
-    return
-  }
+  // The session comes from requireOrgMember like every other endpoint. This used
+  // to do its own lookup against req.body.sessionId, which meant Drive export
+  // authenticated differently from everything else — one Google sign-in, but two
+  // incompatible ways of proving it, so a valid research session was rejected here.
+  const session = req.xupSession
+
   if (!Array.isArray(files) || files.length === 0) {
     res.status(400).json({ error: 'No files provided' })
     return
@@ -381,6 +444,67 @@ app.post('/api/niche/assets', requireOrgMember, async (req, res) => {
     res.json({ marketplace: marketplace || 'com', results: await scrapeAsins(marketplace, list, kinds) })
   } catch (err) {
     console.error('Asset scrape failed:', err)
+    res.status(502).json({ error: err.message })
+  }
+})
+
+// Competitor summary. Built from Data Dive's own analysis plus the creative
+// audit from a scrape, with no language model in the loop — so every figure is
+// traceable to something measured rather than generated.
+// Main images: a keyword, not an ASIN list. Returns the top N ranking products
+// with their main gallery image, for comparing thumbnails at a glance.
+app.post('/api/niche/mainimages', requireOrgMember, async (req, res) => {
+  try {
+    const { query, marketplace, limit } = req.body || {}
+    if (!query || !String(query).trim()) return res.status(400).json({ error: 'query is required' })
+    const data = await searchMainImages(marketplace, query, limit)
+    res.json({ marketplace: marketplace || 'com', ...data })
+  } catch (err) {
+    console.error('main image search failed:', err)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+app.post('/api/niche/summary', requireOrgMember, async (req, res) => {
+  const { link, scraped, focusAsin } = req.body || {}
+  if (!link) {
+    res.status(400).json({ error: 'Paste a Data Dive niche link' })
+    return
+  }
+  try {
+    const niche = await getNicheCompetitors(link)
+    res.json(buildSummary({ niche, scraped, focusAsin }))
+  } catch (err) {
+    console.error('Summary failed:', err)
+    res.status(502).json({ error: err.message })
+  }
+})
+
+// Ends the session. The plugin clears its own copy first, so this is about not
+// leaving a usable session id behind on the server.
+app.post('/api/signout', requireOrgMember, (req, res) => {
+  const sessionId = String(req.get('x-xup-session') || '')
+  sessions.delete(sessionId)
+  res.json({ ok: true })
+})
+
+// Competitor insights: what the product is, which features are pushed, what
+// buyers complain about, and an honest account of what is knowable about the
+// audience. Scrapes listing copy (and optionally reviews, which cost an extra
+// two requests per ASIN because Amazon serves them from a bot-protected URL).
+app.post('/api/niche/insights', requireOrgMember, async (req, res) => {
+  const { asins, marketplace, includeReviews, competitors } = req.body || {}
+  if (!Array.isArray(asins) || asins.length === 0) {
+    res.status(400).json({ error: 'No ASINs provided' })
+    return
+  }
+  const list = asins.map((a) => String(a).trim().toUpperCase()).filter(Boolean).slice(0, 12)
+
+  try {
+    const copies = await scrapeCopyForAsins(marketplace, list, !!includeReviews)
+    res.json(buildInsights({ copies, competitors, marketplace: marketplace || 'com' }))
+  } catch (err) {
+    console.error('Insights failed:', err)
     res.status(502).json({ error: err.message })
   }
 })
