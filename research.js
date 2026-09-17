@@ -400,9 +400,10 @@ function extractAplusImages(html) {
 // what a thumbnail-competitiveness review needs.
 // ---------------------------------------------------------------------------
 
-const SEARCH_RESULT_LIMIT = 50
-// Amazon serves ~16-24 usable organic results per search page, so four pages
-// comfortably covers 50 without scraping pages nobody asked for.
+const SEARCH_RESULT_LIMIT = 20
+// Amazon serves roughly 50 usable organic cards per search page, so the default
+// 20 is covered by a single request and the loop below exits immediately. The
+// extra pages only come into play if a caller asks for a larger limit.
 const SEARCH_MAX_PAGES = 4
 
 function amazonSearchUrl(marketplace, query, page) {
